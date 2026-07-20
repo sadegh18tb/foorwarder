@@ -132,10 +132,21 @@ class EitaaScraper:
             for unwanted in clean_element.find_all(class_=lambda x: x and any(u in x.lower() for u in unwanted_classes)):
                 unwanted.decompose()
 
+            # حذف لینک‌های شیشه‌ای مثل دکمه «مشاهده»
+            for a_tag in clean_element.find_all('a'):
+                if a_tag.get_text(strip=True) == "مشاهده":
+                    a_tag.decompose()
+
             # تبدیل تگ‌های br به خط جدید
             for br in clean_element.find_all("br"):
                 br.replace_with("\n")
-            return clean_element.get_text(separator=" ").strip()
+
+            text = clean_element.get_text(separator=" ").strip()
+            # در صورتی که باز هم کلمه مشاهده در انتهای متن باقی مانده بود
+            if text.endswith("مشاهده"):
+                text = text[:-6].strip()
+
+            return text
         return ""
 
     def _extract_media(self, msg_element):
@@ -231,11 +242,29 @@ class RubikaSender:
         try:
             if media_path and os.path.exists(media_path):
                 # ارسال فایل (عکس یا ویدیو) به همراه کپشن
-                await self.client.send_document(
-                    self.channel_guid,
-                    document=media_path,
-                    caption=text
-                )
+                file_ext = os.path.splitext(media_path)[1].lower()
+                is_video = file_ext in ['.mp4', '.avi', '.mkv']
+                is_photo = file_ext in ['.jpg', '.jpeg', '.png', '.webp']
+
+                # برای اینکه فایل درون برنامه پخش شود، باید از متد مناسب استفاده کرد
+                if is_video:
+                    await self.client.send_video(
+                        self.channel_guid,
+                        video=media_path,
+                        caption=text
+                    )
+                elif is_photo:
+                    await self.client.send_photo(
+                        self.channel_guid,
+                        photo=media_path,
+                        caption=text
+                    )
+                else:
+                    await self.client.send_document(
+                        self.channel_guid,
+                        document=media_path,
+                        caption=text
+                    )
                 logger.info("Successfully sent media to Rubika.")
             else:
                 # ارسال فقط متن
@@ -259,7 +288,7 @@ class AutoForwarder:
         self.telegram = TelegramSender(TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, TELEGRAM_PROXY)
         self.rubika = RubikaSender(RUBIKA_SESSION_NAME, RUBIKA_CHANNEL_GUID)
 
-    def download_media(self, url):
+    def download_media(self, url, post_id):
         """دانلود موقت فایل مدیا"""
         if not url:
             return None
@@ -272,16 +301,39 @@ class AutoForwarder:
             response = requests.get(url, stream=True, timeout=30)
             response.raise_for_status()
 
-            # تشخیص پسوند فایل از URL یا Content-Type
-            ext = ".jpg"
-            if "video" in response.headers.get("Content-Type", "") or ".mp4" in url:
-                ext = ".mp4"
+            # تشخیص پسوند فایل و نام از URL یا هدرها
+            ext = ""
+            # ابتدا تلاش برای یافتن نام اصلی در URL
+            from urllib.parse import urlparse
+            parsed_url = urlparse(url)
+            filename = os.path.basename(parsed_url.path)
 
-            temp_file = f"temp_media{ext}"
-            with open(temp_file, 'wb') as f:
+            if filename and '.' in filename:
+                ext = os.path.splitext(filename)[1]
+
+            if not ext:
+                # حدس زدن پسوند از طریق content-type
+                content_type = response.headers.get("Content-Type", "")
+                if "video" in content_type:
+                    ext = ".mp4"
+                elif "image/png" in content_type:
+                    ext = ".png"
+                elif "image" in content_type:
+                    ext = ".jpg"
+                else:
+                    ext = ".jpg" # پیش فرض
+
+            # برای جلوگیری از تداخل، فایل را با یک نام یونیک بر اساس پست آیدی ذخیره می‌کنیم
+            # تا تلگرام/روبیکا بتوانند بر اساس پسوند آن را درست رندر کنند
+            save_name = filename if (filename and ext) else f"eitaa_post_{post_id}{ext}"
+            # پاکسازی نام فایل از کاراکترهای نامعتبر احتمالی
+            import re
+            save_name = re.sub(r'[\\/*?:"<>|]', "", save_name)
+
+            with open(save_name, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
-            return temp_file
+            return save_name
         except Exception as e:
             logger.error(f"Error downloading media from {url}: {e}")
             return None
@@ -308,7 +360,7 @@ class AutoForwarder:
             logger.info(f"Processing message ID: {msg_id}")
 
             # ۲. دانلود موقت مدیا در صورت وجود
-            media_path = self.download_media(media_url) if media_url else None
+            media_path = self.download_media(media_url, msg_id) if media_url else None
 
             # ۳. ارسال به تلگرام
             # انجام در ترد جداگانه تا بلاک‌کننده نباشد
