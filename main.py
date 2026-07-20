@@ -13,6 +13,7 @@ import logging
 # تنظیمات تلگرام
 TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
 TELEGRAM_CHANNEL_ID = "@your_telegram_channel" # یا ID عددی
+TELEGRAM_PROXY = None # در صورت نیاز به پروکسی، آدرس آن را وارد کنید. مثال: "http://127.0.0.1:10809"
 
 # تنظیمات روبیکا
 # برای روبیکا در اجرای اول نیاز به دریافت کد تایید است تا نشست (Session) ساخته شود.
@@ -122,24 +123,35 @@ class EitaaScraper:
         """استخراج متن پیام"""
         text_element = msg_element.find('div', class_=lambda x: x and 'text' in x.lower())
         if text_element:
+            import copy
+            # کار کردن روی یک کپی برای جلوگیری از تغییر سورس اصلی در صورت نیاز به بخش‌های دیگر
+            clean_element = copy.copy(text_element)
+
+            # حذف المان‌های نامربوط مثل بازدیدها، ساعت، نام کانال و متا دیتاها
+            unwanted_classes = ['meta', 'author', 'views', 'time', 'date', 'reply']
+            for unwanted in clean_element.find_all(class_=lambda x: x and any(u in x.lower() for u in unwanted_classes)):
+                unwanted.decompose()
+
             # تبدیل تگ‌های br به خط جدید
-            for br in text_element.find_all("br"):
+            for br in clean_element.find_all("br"):
                 br.replace_with("\n")
-            return text_element.get_text(separator=" ").strip()
+            return clean_element.get_text(separator=" ").strip()
         return ""
 
     def _extract_media(self, msg_element):
         """استخراج لینک مدیا (عکس یا ویدیو) در صورت وجود"""
-        # جستجو برای عکس
-        photo_element = msg_element.find('a', class_=lambda x: x and 'photo' in x.lower())
-        if photo_element and 'style' in photo_element.attrs:
-            # لینک عکس معمولا در ویژگی style بک‌گراند است
-            style = photo_element['style']
-            if "background-image" in style:
-                start = style.find("url('") + 5
-                end = style.find("')", start)
-                if start > 4 and end != -1:
-                    return style[start:end]
+        # جستجو برای عکس به جز عکس پروفایل کانال
+        # کلاس‌های پروفایل معمولا شامل userpic هستند
+        photo_elements = msg_element.find_all('a', class_=lambda x: x and 'photo' in x.lower() and 'userpic' not in x.lower())
+        for photo_element in photo_elements:
+            if photo_element and 'style' in photo_element.attrs:
+                # لینک عکس معمولا در ویژگی style بک‌گراند است
+                style = photo_element['style']
+                if "background-image" in style:
+                    start = style.find("url('") + 5
+                    end = style.find("')", start)
+                    if start > 4 and end != -1:
+                        return style[start:end]
 
         # جستجو برای ویدیو
         video_element = msg_element.find('video')
@@ -161,10 +173,11 @@ class EitaaScraper:
 class TelegramSender:
     """کلاسی برای ارسال پیام به تلگرام از طریق API رسمی"""
 
-    def __init__(self, token, channel_id):
+    def __init__(self, token, channel_id, proxy=None):
         self.token = token
         self.channel_id = channel_id
         self.base_url = f"https://api.telegram.org/bot{self.token}"
+        self.proxies = {"http": proxy, "https": proxy} if proxy else None
 
     def send_message(self, text, media_path=None):
         try:
@@ -179,7 +192,7 @@ class TelegramSender:
                 with open(media_path, 'rb') as f:
                     files = {'video': f} if is_video else {'photo': f}
                     data = {'chat_id': self.channel_id, 'caption': text}
-                    response = requests.post(url, data=data, files=files, timeout=30)
+                    response = requests.post(url, data=data, files=files, proxies=self.proxies, timeout=60)
                     response.raise_for_status()
                     logger.info("Successfully sent media to Telegram.")
             else:
@@ -189,7 +202,7 @@ class TelegramSender:
 
                 url = self.base_url + "/sendMessage"
                 data = {'chat_id': self.channel_id, 'text': text}
-                response = requests.post(url, data=data, timeout=15)
+                response = requests.post(url, data=data, proxies=self.proxies, timeout=30)
                 response.raise_for_status()
                 logger.info("Successfully sent text to Telegram.")
 
@@ -243,7 +256,7 @@ class RubikaSender:
 class AutoForwarder:
     def __init__(self):
         self.eitaa = EitaaScraper(EITAA_CHANNEL_ID)
-        self.telegram = TelegramSender(TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID)
+        self.telegram = TelegramSender(TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, TELEGRAM_PROXY)
         self.rubika = RubikaSender(RUBIKA_SESSION_NAME, RUBIKA_CHANNEL_GUID)
 
     def download_media(self, url):
